@@ -1,8 +1,10 @@
 //
-//  triangle.metal
+//  RayTrace.metal
 //  MetalEngine
 //
 //  Created by Charlie Wheelwright on 15/07/2025.
+//
+//Metal implementation of https://github.com/SebLague/Ray-Tracing/tree/Episode01
 //
 #include <metal_stdlib>
 #import "../libs/Loki/Loki/loki_header.metal"

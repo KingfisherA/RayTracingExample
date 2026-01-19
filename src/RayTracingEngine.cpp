@@ -10,7 +10,9 @@
 #include <QuartzCore/QuartzCore.hpp>
 //
 #include "Metal/MTLCommandBuffer.hpp"
+#include "Metal/MTLLibrary.hpp"
 #include "Metal/MTLLogState.hpp"
+#include "Metal/MTLRenderPass.hpp"
 #include "Metal/MTLResource.hpp"
 #include "ObjCBridge.hpp"
 #include "RayTracingEngine.hpp"
@@ -176,8 +178,6 @@ void RayTracingEngine::RenderFrame() {
   cd->setClearColor(
       MTL::ClearColor(42.0f / 255.0f, 42.0f / 255.0f, 42.0f / 255.0f, 1.0));
   cd->setStoreAction(MTL::StoreActionStore);
-
-
 
   MTL::RenderCommandEncoder *renderCommandEncoder =
       cmdBuffer->renderCommandEncoder(renderPassDescriptor);
