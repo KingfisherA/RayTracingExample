@@ -26,7 +26,8 @@ RayTracingEngine::RayTracingEngine() {}
 bool RayTracingEngine::Init() {
   bool initSuccess = InitDevice() && CreateDisplay() && CreateQuad() &&
                      CreateDefaultLibrary() && CreateCommandQueue() &&
-                     CreateRenderPipeline() && CreateUniformBuffer();
+                     CreateRenderPipeline() && CreateUniformBuffer() &&
+                     CreateAccumulationTexture();
 
   RenderFrame();
 
@@ -117,6 +118,8 @@ bool RayTracingEngine::CreateRenderPipeline() {
   assert(pipelineDescriptor);
   pipelineDescriptor->colorAttachments()->object(0)->setPixelFormat(
       (MTL::PixelFormat)mMetalLayer->pixelFormat());
+  pipelineDescriptor->colorAttachments()->object(1)->setPixelFormat(
+      MTL::PixelFormatRGBA32Float);
 
   NS::Error *error = nullptr;
   mRenderPipelineState =
@@ -149,6 +152,22 @@ void RayTracingEngine::UpdateUniformBuffer() {
   memcpy(mUniformBuffer->contents(), &mUniformBufferData,
          sizeof(RayTracingEngine::UBO));
 }
+bool RayTracingEngine::CreateAccumulationTexture() {
+  if (mAccumulationTexture)
+    mAccumulationTexture->release();
+
+  MTL::TextureDescriptor *desc = MTL::TextureDescriptor::texture2DDescriptor(
+      MTL::PixelFormatRGBA32Float, mWidth, mHeight, false);
+  desc->setUsage(MTL::TextureUsageRenderTarget);
+  desc->setStorageMode(MTL::StorageModePrivate);
+  mAccumulationTexture = mDevice->newTexture(desc);
+
+  ResetAccumulation();
+  return mAccumulationTexture != nullptr;
+}
+void RayTracingEngine::ResetAccumulation() {
+  mUniformBufferData.accumFrame = 0;
+}
 //
 void RayTracingEngine::Run() {
   // Main loop for running the ray tracing engine
@@ -165,6 +184,11 @@ void RayTracingEngine::RenderFrame() {
   metalDrawable = mMetalLayer->nextDrawable();
 
   mUniformBufferData.frameIdx++;
+  if (mAnimate) {
+    // The scene changes every frame so there is nothing valid to average
+    mUniformBufferData.time += 1.0f;
+    ResetAccumulation();
+  }
   UpdateUniformBuffer();
 
   MTL::CommandBuffer *cmdBuffer = mCommandQueue->commandBuffer();
@@ -179,11 +203,23 @@ void RayTracingEngine::RenderFrame() {
       MTL::ClearColor(42.0f / 255.0f, 42.0f / 255.0f, 42.0f / 255.0f, 1.0));
   cd->setStoreAction(MTL::StoreActionStore);
 
+  // Read back by the fragment shader (programmable blending) and updated with
+  // the new running average. Cleared on reset so stale data is never blended in.
+  MTL::RenderPassColorAttachmentDescriptor *accum =
+      renderPassDescriptor->colorAttachments()->object(1);
+  accum->setTexture(mAccumulationTexture);
+  accum->setLoadAction(mUniformBufferData.accumFrame == 0
+                           ? MTL::LoadActionClear
+                           : MTL::LoadActionLoad);
+  accum->setClearColor(MTL::ClearColor(0.0, 0.0, 0.0, 1.0));
+  accum->setStoreAction(MTL::StoreActionStore);
+
   MTL::RenderCommandEncoder *renderCommandEncoder =
       cmdBuffer->renderCommandEncoder(renderPassDescriptor);
   renderCommandEncoder->setRenderPipelineState(mRenderPipelineState);
   renderCommandEncoder->setVertexBuffer(mQuadVertexBuffer, 0, 0);
   renderCommandEncoder->setVertexBuffer(mUniformBuffer, 0, 1);
+  renderCommandEncoder->setFragmentBuffer(mUniformBuffer, 0, 1);
   renderCommandEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, 0, 6, 1);
   renderCommandEncoder->endEncoding();
 
@@ -193,6 +229,8 @@ void RayTracingEngine::RenderFrame() {
 
   renderPassDescriptor->release();
 
+  mUniformBufferData.accumFrame++;
+
   autoPool->release();
 }
 //
@@ -201,6 +239,7 @@ void RayTracingEngine::Destroy() {
   glfwDestroyWindow(mWindow);
   glfwTerminate();
 
+  mAccumulationTexture->release();
   mUniformBuffer->release();
   mQuadVertexBuffer->release();
   mDevice->release();
@@ -221,6 +260,17 @@ void RayTracingEngine::KeyboardCallback(GLFWwindow *window, int key,
   case GLFW_KEY_F: {
     engine->RenderFrame();
   } break;
+  case GLFW_KEY_SPACE: {
+    // Toggle sphere motion; accumulation only converges while paused
+    if (action == GLFW_PRESS) {
+      engine->mAnimate = !engine->mAnimate;
+      engine->ResetAccumulation();
+    }
+  } break;
+  case GLFW_KEY_R: {
+    if (action == GLFW_PRESS)
+      engine->ResetAccumulation();
+  } break;
   default:
     break;
   }
@@ -232,6 +282,7 @@ void RayTracingEngine::ResizeMetalFramebuffer(int width, int height) {
   UpdateUniformBuffer();
   mWidth = width;
   mHeight = height;
+  CreateAccumulationTexture();
   this->RenderFrame();
 }
 } // namespace Ray

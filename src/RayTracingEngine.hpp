@@ -36,6 +36,9 @@ private:
   bool CreateUniformBuffer();
   void UpdateUniformBuffer();
 
+  bool CreateAccumulationTexture();
+  void ResetAccumulation();
+
   void RenderFrame();
 
   // GLFW
@@ -50,11 +53,16 @@ private:
   MTL::Buffer *mQuadVertexBuffer = nullptr;
   MTL::CommandQueue *mCommandQueue = nullptr;
   MTL::RenderPipelineState *mRenderPipelineState = nullptr;
+  // Running average of all frames since the last reset
+  MTL::Texture *mAccumulationTexture = nullptr;
+  bool mAnimate = false;
 
   //
   struct UBO {
     simd::float2 dimensions{};
     int frameIdx = 0;
+    int accumFrame = 0;
+    float time = 0.0f;
   } mUniformBufferData;
   MTL::Buffer *mUniformBuffer = nullptr;
 };

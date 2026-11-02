@@ -7,7 +7,6 @@
 //Metal implementation of https://github.com/SebLague/Ray-Tracing/tree/Episode01
 //
 #include <metal_stdlib>
-#import "../libs/Loki/Loki/loki_header.metal"
 
 using namespace metal;
 
@@ -19,14 +18,18 @@ struct VertexOut
 {
     float4 position [[position]];
     float2 uvCoord;
-    int frameIdx;
     float aspect;
 };
 
+// Must match RayTracingEngine::UBO
 struct UBO
 {
     float2 dimensions;
     int frameIdx;
+    // Number of frames already averaged into the accumulation target
+    int accumFrame;
+    // Animation time, only advances while motion is enabled
+    float time;
 };
 
 float4x4 Perspective(float fovyRadians, 
@@ -59,7 +62,6 @@ vertex VertexOut vertexShader(uint vertexID [[vertex_id]],
     // float4x4 mvpMatrix = Perspective((45.0f/180.0f) * PI, uniformBuffer->dimensions.y/uniformBuffer->dimensions.x, 0.001f, 100.0f);
     // out.rayOrigin = (mvpMatrix * float4(vertexData[vertexID].position, 1.0f)).xyz;
     out.uvCoord = (vertexData[vertexID].position + float2(1.0f)) * 0.5f;
-    out.frameIdx = uniformBuffer->frameIdx;
 
     return out;
 }
@@ -107,7 +109,7 @@ struct Sphere
 //
 constant float epsilon = 0.001f;
 constant int MaxBounces = 10;
-constant int NumberOfRaysPerFragment = 180;
+constant int NumberOfRaysPerFragment = 64;
 constant float DivergeStrength = 0.0001f;
 constant int NumSpheres = 5;
 
@@ -115,26 +117,23 @@ constant int NumSpheres = 5;
 
 // PCG (permuted congruential generator). Thanks to:
 // www.pcg-random.org and www.shadertoy.com/view/XlGcRh
-// uint NextRandom(thread uint& state)
-// {
-//     state = state * 747796405 + 2891336453;
-//     uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
-//     result = (result >> 22) ^ result;
-//     return result;
-// }
-
-// float RandomValue(thread uint& state)
-// {
-//     return NextRandom(state) / 4294967295.0; // 2^32 - 1
-// }
-
-float RandomValue(thread Loki& state)
+uint NextRandom(thread uint& state)
 {
-    return state.rand();
+    state = state * 747796405 + 2891336453;
+    uint result = ((state >> ((state >> 28) + 4)) ^ state) * 277803737;
+    result = (result >> 22) ^ result;
+    return result;
+}
+
+// Uniform value in [0, 1). Uses the top 24 bits so the float conversion can
+// never round up to 1.0 (which would make log(1 - u) below return -inf)
+float RandomValue(thread uint& state)
+{
+    return (NextRandom(state) >> 8) * (1.0f / 16777216.0f);
 }
 
 // Random value in normal distribution (with mean=0 and sd=1)
-float RandomValueNormalDistribution(thread Loki& state)
+float RandomValueNormalDistribution(thread uint& state)
 {
     // Thanks to https://stackoverflow.com/a/6178290
     float theta = 2.0f * PI * RandomValue(state);
@@ -143,7 +142,7 @@ float RandomValueNormalDistribution(thread Loki& state)
 }
 
 // Calculate a random direction
-float3 RandomDirection(thread Loki& state)
+float3 RandomDirection(thread uint& state)
 {
     // Thanks to https://math.stackexchange.com/a/1585996
     float x = RandomValueNormalDistribution(state);
@@ -152,13 +151,13 @@ float3 RandomDirection(thread Loki& state)
     return normalize(float3(x, y, z));
 }
 
-float3 RandomHemisphereDirection(float3 normal, thread Loki& state)
+float3 RandomHemisphereDirection(float3 normal, thread uint& state)
 {
     float3 dir = RandomDirection(state);
     return dir * sign(dot(dir, normal));
 }
 
-float2 RandomPointInCircle(thread Loki& state)
+float2 RandomPointInCircle(thread uint& state)
 {
     float angle = RandomValue(state) * 2 * PI;
     float2 pointOnCircle = float2(cos(angle), sin(angle));
@@ -275,7 +274,7 @@ float3 RefractInternalReflection(float3 dir, float3 normal, float eta)
         return refract(dir, normal, ri); 
 }
 
-float3 Trace(Ray ray, thread Sphere* spheres, thread Loki& state)
+float3 Trace(Ray ray, thread Sphere* spheres, thread uint& state)
 {
     float3 incomingLight = float3(0.0f);
     float3 rayColour = float3(1.0f);
@@ -290,6 +289,10 @@ float3 Trace(Ray ray, thread Sphere* spheres, thread Loki& state)
             ray.origin = collision.hitPoint;
 
             float3 diffuseDir = collision.normal + RandomDirection(state);
+            // Guard against normalize(0) when the random direction cancels the normal,
+            // a single NaN would otherwise persist in the accumulation forever
+            if (dot(diffuseDir, diffuseDir) < 1e-8f)
+                diffuseDir = collision.normal;
             float3 specularDir = reflect(ray.dir, collision.normal);
             float eta = 1.33f;
             float3 refractDir = RefractInternalReflection(ray.dir, collision.normal, eta);
@@ -327,8 +330,20 @@ float3 Trace(Ray ray, thread Sphere* spheres, thread Loki& state)
     return incomingLight;
 }
 
-fragment float4 fragmentShader(VertexOut vDataIn [[stage_in]]) {
-    Loki loki = Loki((uint)(vDataIn.uvCoord.x * 73464950.0f), (uint)(vDataIn.uvCoord.y * 283948042.0f) /*, vDataIn.frameIdx * 8000*/);
+struct FragmentOut
+{
+    float4 colour [[color(0)]];
+    float4 accumulation [[color(1)]];
+};
+
+fragment FragmentOut fragmentShader(VertexOut vDataIn [[stage_in]],
+                                    constant UBO* uniformBuffer [[buffer(1)]],
+                                    float4 previousAverage [[color(1)]])
+{
+    // Unique seed per pixel and per frame so the noise changes every frame and averages out
+    uint2 pixel = uint2(vDataIn.position.xy);
+    uint rngState = pixel.y * uint(uniformBuffer->dimensions.x) + pixel.x
+                  + uint(uniformBuffer->frameIdx) * 719393u;
 
     float planeHeight = nearPlane * tan(0.5f * FOV) * 2.0f;
     float planeWidth = planeHeight * vDataIn.aspect;
@@ -338,7 +353,7 @@ fragment float4 fragmentShader(VertexOut vDataIn [[stage_in]]) {
 
     float3 camPos = float3(0.0f, 0.0f, 0.0f);
 
-    float motion = cos((float)vDataIn.frameIdx/50.0f);
+    float motion = cos(uniformBuffer->time / 50.0f);
 
     Sphere spheres[NumSpheres] = {
         {{-0.2f, 0.0f, 1.0f}, 0.1f, {{1.0f,0.0f,0.0f}, 0.0f, float3(0.0f), 0.0f, 0.0f}},
@@ -356,15 +371,21 @@ fragment float4 fragmentShader(VertexOut vDataIn [[stage_in]]) {
         ray.origin = camPos;
         ray.dir = normalize(viewPoint - ray.origin);
 
-        float2 jitter = RandomPointInCircle(loki) * DivergeStrength;
+        float2 jitter = RandomPointInCircle(rngState) * DivergeStrength;
         ray.dir += float3(jitter, 0.0f);
         ray.origin += float3(jitter, 0.0f);
         
-        totalIncomingLight += Trace(ray, spheres, loki);
+        totalIncomingLight += Trace(ray, spheres, rngState);
     }
     
     totalIncomingLight /= NumberOfRaysPerFragment;
 
+    // Progressive accumulation: running average of every frame since the last reset
+    float weight = 1.0f / (uniformBuffer->accumFrame + 1);
+    float3 average = mix(previousAverage.rgb, totalIncomingLight, weight);
 
-    return float4(totalIncomingLight, 1.0f);
+    FragmentOut out;
+    out.colour = float4(average, 1.0f);
+    out.accumulation = float4(average, 1.0f);
+    return out;
 }
